@@ -1,0 +1,341 @@
+---
+title: "itsar-vignette"
+author: "William M. Old, Kristofor Webb"
+date: "6/11/2020"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{itsar-vignette}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  echo = TRUE,
+  fig.width=7, fig.height=7,
+  fig.align = "center"
+  )
+options(tibble.print_min = 4L, tibble.print_max = 4L)
+```
+
+## Using the itsar package to identify protein targets of staurosporine from a protein lysate experiment  
+
+This vignette demonstrates how to use the **itsar** package to analyze thermal profiling proteomic data collected using 
+the isothermal shift assay (iTSA) method as published in Ball, KA et al. 2020. This method 
+provides improved experimental design and statistical power for identifying the binding targets of small
+molecules in complex proteomes, in either lysates or cells.
+
+
+You can see more documentation of the itsar package once installed by typing at the command prompt `?itsar`.
+Once there, click on the "Index" hyperlink at the bottom of page to see a list of functions, 
+each with documentation.
+
+iTSA Paper:
+Ball KA, Webb KJ, Coleman SJ, Cozzolino KA, Jacobsen J, Jones KR, Stowell MHB, Old WM (2020).
+An isothermal shift assay for proteome scale drug-target identification. Communications Biology 3, 1–10.
+DOI: 10.1038/s42003-020-0795-6
+
+## Load required packages for this vignette
+Load R packages, including the itsar package (make sure it is installed from CU Boulder Old lab GitHub)
+```{r loading-libs, message=FALSE}
+library(itsar)
+library(tidyverse)
+require(magrittr)
+require(dplyr)
+requireNamespace("limma", quietly=T)
+requireNamespace("sva", quietly=T)
+
+
+options(stringsAsFactors = FALSE)
+
+```
+
+Ensure that sample names and data column names are correct by reading in the header for the proteinGroups.txt file.
+In this example, we are analyzing data from the iTSA paper that performed an iTSA experiment at 52C using 
+the broad spectrum kinase inhibitor, staurosporine. MaxQuant was used to quantify the Drug vs. Control TMT10 experiment
+in which drug and vehicle conditions alternated channels across the 10-plex (see paper for more details). 
+The MaxQuant proteinGroups.txt file contains the protein-level TMT channel intensities that have been corrected for
+channel-specific isotope impurities, with protein annotation information as well. We only focus on the 52C experiment here.
+
+```{r}
+#Read proteinGroups file
+proteinGroupFile <- system.file("extdata",
+                                       "proteinGroups_itsa_staurosporine_3temp_20190402KB.txt.gz",
+                                       package = "itsar")
+# read the first line of file to retrieve the column names, for properly setting up the sample names
+# gzfile() is used because we are reading a gzipped tab delimited file
+# 
+pgfilecolnames <- as.character(
+   read.table(
+      file = gzfile(proteinGroupFile),
+      header = F,
+      nrows = 1,
+      sep = "\t",
+      na.strings = c("NA","NaN","Infinite"),
+      fill = T,
+      stringsAsFactors = F,
+      quote = "\"")[1,])
+ 
+### Filter data columns & define TMT data columns
+# identifies column numbers that contain Label corrected intensity data (TMT lot-specific correction)
+tmtdata_colnames <- grep("Reporter intensity corrected \\d+ 52C", pgfilecolnames, value = T)
+
+```
+
+Use the `itsar::read_maxquant_proteingroupfile()` function to read in the TMT protein data into a data frame
+and convert to tibble (see dplyr package for more information on tibbles and tidyverse. This function returns 
+a list containing a data frame of the protein TMT data and a character vector of column names.
+
+```{r}
+
+plist <- itsar::read_maxquant_proteingroupfile(
+  proteinGroups.filename = proteinGroupFile,
+  datacolnames = tmtdata_colnames,
+  uniprot.id.column = "Majority protein IDs",
+  uniprot.acc.column = "Fasta headers",
+  null.zeros = T,
+  log2.transform = F,
+  is.gzip.file = T)
+
+prot.table <- plist$prot.table
+tmtdata_colnames <- plist$prot.colnms
+
+tmtdata_colnames
+prot.table <- as_tibble(prot.table)
+
+```
+
+Remove poorly quantified proteins with less than 2 unique peptides, using the dplyr function `dplyr::filter`
+
+```{r}
+# Remove poorly quantified proteins with less than 2 unique peptides
+prot.table <- dplyr::filter(prot.table, Reverse != "+", 
+                            Potential.contaminant != "+", 
+                            Only.identified.by.site != "+",
+                             Reporter.intensity.count.3.52C > 2,
+                            Unique.peptides > 1)
+
+
+
+```
+
+
+Check for duplicate gene symbols (there will be) and make unique names using the annotation in the 
+"Gene.names" column as primary names and the annotation in "Protein.IDs" as name for those that do not have an gene name. 
+Then check uniqueness
+
+```{r}
+
+# Are there any duplicated gene names?
+
+prot.table$Gene.names %>% duplicated() %>% any()
+
+prot.table %>% dplyr::group_by(Gene.names) %>% 
+  dplyr::summarize(frequency = n()) %>% 
+  dplyr::arrange(desc(frequency)) %>% 
+  dplyr::filter(frequency > 1)
+
+#prot.table <- DEP::make_unique(prot.table, "Gene.names", "Protein.IDs", delim = ";")
+
+# prot.table %>% dplyr::group_by(name) %>% 
+#   dplyr::summarize(frequency = n()) %>% 
+#   dplyr::arrange(desc(frequency)) %>% 
+#   dplyr::filter(frequency > 1)
+
+```
+
+Check the densities of TMT data, will be lognormally distributed if columns haven't been log2 transformed
+```{r}
+limma::plotDensities(prot.table[,tmtdata_colnames], legend = "topright")
+
+```
+
+Log2 transform and quantile normalize 
+```{r}
+prot.table[,tmtdata_colnames] <- log2(prot.table[,tmtdata_colnames] )
+
+limma::plotDensities(prot.table[,tmtdata_colnames], legend = "topright")
+
+prot.table[,tmtdata_colnames] <- limma::normalizeBetweenArrays(as.matrix(prot.table[,tmtdata_colnames]),
+                                                        method="quantile" )
+
+
+```
+
+Set up the targets matrix, which describes the experimental design. We are going to compare two models, 
+one in which we correct for unexplained batch effects, and one in which we don't. 
+First set up two different model matrices
+
+```{r}
+
+
+targets <- data.frame(samples = tmtdata_colnames,
+                      treatment = factor(rep(c("Vehicle","Drug"), 5), levels = c("Vehicle","Drug")))
+targets
+
+origdesign <- model.matrix(~0+treatment, data = targets)
+colnames(origdesign) <- c("Vehicle","Drug")  #V=Vehicle; D=Drug
+
+origdesign
+
+design <- model.matrix(~treatment, data = targets)
+colnames(design) <- c("intercept","Drug") 
+
+
+```
+## Statistical testing
+
+Run model without the batch effect correction (empirical Bayes linear modeling) 
+
+```{r}
+### Use limma for empirical bayes
+
+
+fit <- limma::lmFit(prot.table[,tmtdata_colnames], origdesign)
+
+fit <- limma::eBayes(fit) ##Apply empirical Bayes smoothing to the standard errors.
+
+contrast <- limma::makeContrasts("Drug-Vehicle", levels=origdesign)
+
+fit2 <- limma::contrasts.fit(fit, contrast)
+fit2$Amean <- log2(prot.table$Intensity.52C)
+
+fit2 <- limma::eBayes(fit2, trend = TRUE)
+```
+
+Use the get_toptable() function `itsar::get_toptable()`  (from itsar package)
+
+```{r}
+pstats <- itsar::get_toptable(fit2,
+                              coef = 1, 
+                              glist = prot.table[,c("id", "Gene.names", "uniprot.id")], 
+                              suffix = ".uncor" )
+
+pstats <- pstats %>% arrange(P.Value.uncor)
+
+sum(pstats$P.Value.uncor <= 0.05)
+sum(pstats$P.Value.uncor <= 0.01)
+sum(pstats$P.Value.uncor<= 0.001)
+
+pstats
+
+```
+
+Run model that incorporates latent variables that correct batch effects using
+the R package sva. sva creates surrogate variables that model batch effects in 
+the data, which are then added to the specified variables used in the 
+empirical Bayes linear modeling with limma. 
+
+```{r}
+
+mod0 <- model.matrix(~1, data = targets)
+colnames(mod0) <- "intercept"
+dmat <- as.matrix(prot.table[,tmtdata_colnames])
+
+numsv <- sva::num.sv(dmat, design, method = "be", B = 100)
+
+
+svobj <- sva::sva(dmat,design,mod0,n.sv = 3) 
+
+modSv = cbind(design,svobj$sv)
+mod0Sv = cbind(mod0,svobj$sv)
+pValuesSv = sva::f.pvalue(dmat,modSv,mod0Sv)
+qValuesSv = p.adjust(pValuesSv,method="BH")
+sum(qValuesSv < 0.1, na.rm = T)
+
+
+svafit <- lmFit(dmat , modSv)
+contrast.matrix <- cbind("intercept" = c(1,0, rep(0,svobj$n.sv) ), "Drug"= c(0,1,rep(0,svobj$n.sv)))
+
+
+fitContrasts = limma::contrasts.fit(svafit,contrast.matrix)
+
+svafit$Amean <- log2(prot.table$Intensity.52C)
+
+fit2_sva <- eBayes(fitContrasts, trend = TRUE)
+```
+
+Use the itsar function get_toptable() to retrieve all tested proteins, and sort by p-value.
+The p-values are corrected using the BH method.
+```{r}
+pstats_sva <- itsar::get_toptable(fit2_sva, coef = "Drug", 
+                                  glist = prot.table[,c("id", "Gene.names", "uniprot.id")], 
+                                  suffix = ".sva" )
+
+pstats_sva <- pstats_sva %>% arrange(P.Value.sva)
+
+sum(pstats_sva$adj.P.Val.sva <= 0.05)
+sum(pstats_sva$adj.P.Val.sva <= 0.01)
+sum(pstats_sva$adj.P.Val.sva<= 0.001)
+
+pstats_sva
+
+```
+
+## Plotting
+
+Make volcano plots to show the relationship between the effect size for drug-induced 
+thermal-stabilization (log2(Staurosporine/DMSO)) and -log10(p-value) for differential expression 
+Uses the itsar function `itsar::ggvolcano()`
+
+```{r}
+
+pstats$logp <- -log10(pstats$P.Value.uncor)
+pstats_sva$logp <- -log10(pstats_sva$P.Value.sva)
+range(pstats$logp)
+range(pstats$logFC.uncor)
+
+range(pstats_sva$logp)
+range(pstats_sva$logFC.sva)
+
+volcanoplots_uncor <- itsar::ggvolcano(pstats, xvar = logFC.uncor,
+                   yvar = logp,
+                   labelvar = Gene.names.uncor,
+                   adjpvalvar = adj.P.Val.uncor,
+                   fdr.range.cut = c(0,0.01,0.1,1),
+                   high.sig.threshold = 0.001,
+                   annotgenes = T, xlimits = c(-2, 2), ylimits = c(0, 16))
+
+
+volcanoplots_sva <- itsar::ggvolcano(pstats_sva, xvar = logFC.sva,
+                   yvar = logp,
+                   labelvar = Gene.names.sva,
+                   adjpvalvar = adj.P.Val.sva,
+                   fdr.range.cut = c(0,0.01,0.1,1),
+                   high.sig.threshold = 0.001,
+                   annotgenes = T, xlimits = c(-2, 2), ylimits = c(0, 16))
+
+
+
+```
+ 
+Volcano plot for uncorrected analysis
+
+```{r fig.width = 5, fig.asp = 1.1}
+
+volcanoplots_uncor$ggplot_volcano
+
+```
+
+Volcano plot for SVA batch corrected analyses:
+```{r fig.width = 5, fig.asp = 1.1}
+
+volcanoplots_sva$ggplot_volcano
+
+```
+
+Interactive plotly volcano plots 
+```{r fig.width = 5, fig.asp = 1.2}
+
+volcanoplots_uncor$plotly_volcano
+
+```
+
+Volcano plot for SVA batch corrected analyses:
+```{r fig.width = 5, fig.asp = 1.2}
+
+volcanoplots_sva$plotly_volcano
+
+```
